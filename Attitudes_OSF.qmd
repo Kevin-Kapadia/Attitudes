@@ -1,0 +1,1143 @@
+---
+title: "Public Support for Sports Betting Restrictions: Analysis Code"
+format:
+  html:
+    toc: true
+    toc-depth: 5
+    number-sections: false
+editor: visual
+embed-resources: true
+---
+
+```{r, warning=FALSE, include=FALSE}
+options(tibble.width = Inf)
+options(scipen = 5)
+
+library(tidyverse)
+library(kableExtra)
+library(lme4)
+library(lmerTest)
+library(sjPlot)
+library(car)
+
+myColors <- c("#fc7489", "#faa24b", "#f2da5a", "#b0d8b3", "#add8e6", "#d8bfe3", "#ffd1dc", "#f9c4a5", "#c8c8f0")
+twoColors <- c("#faa24b", "#add8e6")
+threeColors <- c("#fc7489", "#f2da5a", "#add8e6")
+```
+
+This document reproduces every analysis in the manuscript, in the order the results appear. Section headings name the manuscript table each chunk produces. Sections marked supplementary are not reported in the manuscript. The data file (attitudes_osf.csv) has identifying fields removed and participant IDs replaced with study codes.
+
+## Functions {.hidden}
+
+```{r, include=FALSE}
+numericSummary <- function(data) {
+  is_single_var <- is.vector(data) || (is.data.frame(data) && ncol(data) == 1 && is.numeric(data[[1]]))
+
+  if (is_single_var) {
+    values <- if (is.data.frame(data)) data[[1]] else data
+    tibble(
+      Mean = round(mean(values, na.rm = TRUE), 2),
+      SD = round(sd(values, na.rm = TRUE), 2),
+      Min = round(min(values, na.rm = TRUE), 2),
+      Median = round(median(values, na.rm = TRUE), 2),
+      Max = round(max(values, na.rm = TRUE), 2)
+    )
+  } else if (is.data.frame(data)) {
+    data %>%
+      select(where(is.numeric)) %>%
+      pivot_longer(cols = everything(), names_to = "Variable", values_to = "Value") %>%
+      group_by(Variable) %>%
+      summarise(
+        Mean = round(mean(Value, na.rm = TRUE), 2),
+        SD = round(sd(Value, na.rm = TRUE), 2),
+        Min = round(min(Value, na.rm = TRUE), 2),
+        Median = round(median(Value, na.rm = TRUE), 2),
+        Max = round(max(Value, na.rm = TRUE), 2),
+        .groups = "drop"
+      )
+  } else {
+    stop("Input must be a numeric vector or a data frame with numeric columns.")
+  }
+}
+```
+
+```{r, include=FALSE}
+categoricalSummary <- function(data) {
+  is_single_var <- is.vector(data) || (is.data.frame(data) && ncol(data) == 1 && (is.factor(data[[1]]) || is.character(data[[1]])))
+
+  if (is_single_var) {
+    values <- as.factor(if (is.data.frame(data)) data[[1]] else data)
+    tibble(Level = fct_infreq(values)) %>%
+      count(Level) %>%
+      mutate(Percent = round(100 * n / sum(n), 2)) %>%
+      arrange(desc(n))
+  } else if (is.data.frame(data)) {
+    data %>%
+      select(where(~ is.factor(.x) || is.character(.x))) %>%
+      pivot_longer(cols = everything(), names_to = "Variable", values_to = "Level") %>%
+      count(Variable, Level) %>%
+      group_by(Variable) %>%
+      mutate(
+        Percent = round(100 * n / sum(n), 2),
+        Level = fct_reorder(Level, n, .desc = TRUE)
+      ) %>%
+      arrange(Variable, desc(n)) %>%
+      ungroup()
+  } else {
+    stop("Input must be a factor/character vector or a data frame with categorical columns.")
+  }
+}
+
+```
+
+```{r, include=FALSE}
+formatCor <- function(r) {
+  out <- sprintf("%.2f", r)
+  out <- sub("^(-?)0\\.", "\\1.", out)
+  out <- sub("^-\\.00$", ".00", out)
+  out[is.na(r)] <- ""
+  out
+}
+
+pairCor <- function(a, b) {
+  ok <- complete.cases(a, b)
+  if (sum(ok) < 3 || sd(a[ok]) == 0 || sd(b[ok]) == 0) {
+    return(c(r = NA_real_, p = NA_real_))
+  }
+  test <- cor.test(a[ok], b[ok])
+  c(r = unname(test$estimate), p = test$p.value)
+}
+
+#Numeric variables are kept as is. Categorical variables are dummy coded exactly as lm() would code them
+#(first level is the reference), so the correlations line up with the regression coefficients
+designColumns <- function(data, vars, labels = NULL) {
+  cols <- lapply(vars, function(v) {
+    label <- if (!is.null(labels) && v %in% names(labels)) labels[[v]] else v
+    x <- data[[v]]
+    if (is.numeric(x)) {
+      out <- tibble(x)
+      names(out) <- label
+      return(out)
+    }
+    f <- factor(x)
+    dummies <- lapply(levels(f)[-1], function(l) as.numeric(f == l))
+    names(dummies) <- paste0(label, ": ", levels(f)[-1])
+    as_tibble(dummies)
+  })
+  bind_cols(cols)
+}
+
+#Square tables (y = NULL) list every variable as a row, show the lower triangle, and drop the last column
+#because it would be empty. Rectangular tables show every cell. The Holm correction is applied across
+#all unique correlations in the table (holmBy = "table") or separately within each column of a
+#rectangular table (holmBy = "column"). An asterisk marks Holm-adjusted p < .05
+corTable <- function(x, y = NULL, caption = NULL, holmBy = "table") {
+  symmetric <- is.null(y)
+  if (symmetric) {
+    y <- x
+  }
+  if (symmetric && holmBy == "column") {
+    stop("holmBy = 'column' is only available for rectangular tables")
+  }
+  r <- matrix(NA_real_, ncol(x), ncol(y), dimnames = list(names(x), names(y)))
+  p <- r
+  for (i in seq_len(ncol(x))) {
+    for (j in seq_len(ncol(y))) {
+      res <- pairCor(x[[i]], y[[j]])
+      r[i, j] <- res["r"]
+      p[i, j] <- res["p"]
+    }
+  }
+  keep <- if (symmetric) lower.tri(r) else matrix(TRUE, nrow(r), ncol(r))
+  pAdj <- p
+  if (holmBy == "column") {
+    for (j in seq_len(ncol(p))) {
+      pAdj[, j] <- p.adjust(p[, j], method = "holm")
+    }
+  } else {
+    pAdj[keep] <- p.adjust(p[keep], method = "holm")
+  }
+  stars <- ifelse(!is.na(pAdj) & pAdj < .05, "*", "")
+  out <- matrix(paste0(formatCor(r), ifelse(is.na(r), "", stars)), nrow(r), ncol(r), dimnames = dimnames(r))
+  out[!keep] <- ""
+  if (symmetric) {
+    diag(out) <- "-"
+    rownames(out) <- paste0(seq_len(nrow(out)), ". ", rownames(out))
+    colnames(out) <- paste0(seq_len(ncol(out)), ".")
+    out <- out[, -ncol(out), drop = FALSE]
+  }
+  holmNote <- if (holmBy == "column") {
+    paste0("within each column (", nrow(r), " correlations per column)")
+  } else {
+    paste0("across the ", sum(keep), " correlations in this table")
+  }
+  kbl(out, align = "c", caption = caption) %>%
+    kable_styling(full_width = FALSE, font_size = 12) %>%
+    footnote(general = paste0("Pearson r with pairwise deletion. * Holm-adjusted p < .05, corrected ", holmNote, "."),
+      general_title = "Note. ",
+      footnote_as_chunk = TRUE) %>%
+    scroll_box(width = "100%")
+}
+```
+
+```{r, include=FALSE}
+#Builds a model formula from blocks of predictor names so every model in a section uses an identical set
+modelFormula <- function(dv, predictors, random = NULL) {
+  as.formula(paste(dv, "~", paste(c(predictors, random), collapse = " + ")))
+}
+
+#car::vif returns a GVIF matrix whenever a model contains a multi-level factor. Squaring the
+#GVIF^(1/(2*Df)) column puts every term back on the familiar VIF scale so one cutoff applies to all rows
+vifValues <- function(model) {
+  v <- vif(model)
+  if (is.matrix(v)) {
+    setNames(v[, "GVIF^(1/(2*Df))"]^2, rownames(v))
+  } else {
+    v
+  }
+}
+
+vifTable <- function(models, labels, caption = NULL) {
+  map2(models, labels, function(m, l) {
+    v <- vifValues(m)
+    tibble(Term = names(v), Model = l, VIF = as.numeric(v))
+  }) %>%
+    bind_rows() %>%
+    pivot_wider(names_from = Model, values_from = VIF) %>%
+    kbl(digits = 2, caption = caption) %>%
+    kable_styling(full_width = FALSE) %>%
+    footnote(general = "Values are VIFs. Terms with more than one degree of freedom are reported as GVIF^(1/(2*Df)) squared so they are on the same scale. Values above 5 warrant attention and values above 10 indicate serious multicollinearity.",
+      general_title = "Note. ",
+      footnote_as_chunk = TRUE)
+}
+
+skewness <- function(x) {
+  x <- x[!is.na(x)]
+  mean((x - mean(x))^3) / sd(x)^3
+}
+
+kurtosis <- function(x) {
+  x <- x[!is.na(x)]
+  mean((x - mean(x))^4) / sd(x)^4 - 3
+}
+```
+
+```{r, include=FALSE}
+#Marginal R2 is the variance explained by the fixed effects alone and conditional R2 adds the
+#participant random intercept (Nakagawa & Schielzeth, 2013). ICC is the share of variance that is
+#left unexplained by the fixed effects and sits between participants
+mixedFitTable <- function(models, labels, caption = NULL) {
+  map2(models, labels, function(m, l) {
+    varFixed <- var(as.vector(model.matrix(m) %*% fixef(m)))
+    varRandom <- sum(sapply(VarCorr(m), function(v) v[1]))
+    varResid <- sigma(m)^2
+    tibble(Model = l,
+      Observations = nobs(m),
+      Participants = unname(ngrps(m)["ParticipantID"]),
+      ICC = varRandom / (varRandom + varResid),
+      MarginalR2 = varFixed / (varFixed + varRandom + varResid),
+      ConditionalR2 = (varFixed + varRandom) / (varFixed + varRandom + varResid),
+      Singular = isSingular(m))
+  }) %>%
+    bind_rows() %>%
+    kbl(digits = 3, caption = caption) %>%
+    kable_styling(full_width = FALSE)
+}
+
+lmFitTable <- function(models, labels, caption = NULL) {
+  map2(models, labels, function(m, l) {
+    res <- resid(m)
+    cooks <- cooks.distance(m)
+    tibble(Model = l,
+      N = nobs(m),
+      F = unname(summary(m)$fstatistic[1]),
+      df1 = unname(summary(m)$fstatistic[2]),
+      df2 = unname(summary(m)$fstatistic[3]),
+      R2 = summary(m)$r.squared,
+      AdjR2 = summary(m)$adj.r.squared,
+      ModelP = pf(summary(m)$fstatistic[1], summary(m)$fstatistic[2], summary(m)$fstatistic[3], lower.tail = FALSE),
+      MaxVIF = max(vifValues(m)),
+      BreuschPaganP = ncvTest(m)$p,
+      ResidualSkew = skewness(res),
+      ResidualKurtosis = kurtosis(res),
+      MaxCooksD = max(cooks),
+      Influential = sum(cooks > 4 / nobs(m)))
+  }) %>%
+    bind_rows() %>%
+    kbl(digits = 3, caption = caption) %>%
+    kable_styling(full_width = FALSE) %>%
+    footnote(general = "BreuschPaganP below .05 indicates non-constant residual variance. Influential counts cases with Cook's D above 4/n; values of Cook's D above 1 are the conventional concern.",
+      general_title = "Note. ",
+      footnote_as_chunk = TRUE)
+}
+
+residualTable <- function(models, labels, caption = NULL) {
+  map2(models, labels, function(m, l) {
+    res <- resid(m)
+    tibble(Model = l,
+      ResidualSD = sd(res),
+      Skew = skewness(res),
+      Kurtosis = kurtosis(res),
+      ShapiroP = shapiro.test(res)$p.value)
+  }) %>%
+    bind_rows() %>%
+    kbl(digits = 3, caption = caption) %>%
+    kable_styling(full_width = FALSE) %>%
+    footnote(general = "Shapiro-Wilk is oversensitive at this sample size, so the quantile plots below are the more informative check. Skew and kurtosis within about plus or minus 1 are unproblematic for regression.",
+      general_title = "Note. ",
+      footnote_as_chunk = TRUE)
+}
+
+residualPlots <- function(models, labels) {
+  plotData <- map2(models, labels, function(m, l) {
+    tibble(Model = l, Fitted = fitted(m), Residual = resid(m))
+  }) %>%
+    bind_rows() %>%
+    mutate(Model = factor(Model, levels = labels))
+  fittedPlot <- ggplot(plotData, aes(x = Fitted, y = Residual)) +
+    geom_point(alpha = 0.25, size = 0.8, color = "#add8e6") +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+    geom_smooth(method = "loess", formula = y ~ x, se = FALSE, color = "#fc7489", linewidth = 0.6) +
+    facet_wrap(~ Model, scales = "free_x") +
+    theme_minimal() +
+    labs(title = NULL,
+      x = "Fitted value",
+      y = "Residual")
+  qqPlot <- ggplot(plotData, aes(sample = Residual)) +
+    stat_qq(alpha = 0.25, size = 0.8, color = "#add8e6") +
+    stat_qq_line(color = "#fc7489", linewidth = 0.6) +
+    facet_wrap(~ Model) +
+    theme_minimal() +
+    labs(title = NULL,
+      x = "Theoretical quantile",
+      y = "Sample quantile")
+  list(fitted = fittedPlot, qq = qqPlot)
+}
+```
+
+## Data Cleaning {.hidden}
+
+```{r, include=FALSE}
+att <- read.csv("attitudes_osf.csv")
+att <- subset(att, att$Finished == TRUE)
+```
+
+### Bet Allowance Statements {.hidden}
+
+```{r, include=FALSE}
+#The nine bet allowance statements keep the coding participants gave them (0 = strongly disagree,
+#6 = strongly agree). Nothing is reverse coded because each bet type is analyzed on its own, so a high
+#score always means more agreement with that particular statement
+attitude_statements <- att %>% select(starts_with("AttitudeStatements"), ParticipantID)
+
+attitude_statements <- attitude_statements %>%
+  mutate(across(
+    starts_with("AttitudeStatements"),
+    ~ case_when(
+      str_detect(as.character(.x), regex("^Strongly disagree$", ignore_case = TRUE)) ~ 0,
+      str_detect(as.character(.x), regex("^Somewhat disagree$", ignore_case = TRUE)) ~ 2,
+      str_detect(as.character(.x), regex("^Disagree$", ignore_case = TRUE)) ~ 1,
+      str_detect(as.character(.x), regex("^Neither agree nor disagree$", ignore_case = TRUE)) ~ 3,
+      str_detect(as.character(.x), regex("^Somewhat agree$", ignore_case = TRUE)) ~ 4,
+      str_detect(as.character(.x), regex("^Agree$", ignore_case = TRUE)) ~ 5,
+      str_detect(as.character(.x), regex("^Strongly agree$", ignore_case = TRUE)) ~ 6,
+      TRUE ~ NA_real_),
+    .names = "{.col}_num"))
+
+attitude_statements_long <- attitude_statements %>%
+  select(ParticipantID, ends_with("_num")) %>%
+  pivot_longer(
+    cols = ends_with("_num"),
+    names_to = "Statement",
+    values_to = "Response") %>%
+  mutate(idx = as.integer(str_extract(Statement, "\\d+")),
+    BetsAllowed = case_when(
+      idx %% 3 == 1 ~ "No bets allowed",
+      idx %% 3 == 2 ~ "No proposition bets allowed",
+      idx %% 3 == 0 ~ "All bets allowed"),
+    LeagueType = case_when(
+      idx %in% 1:3 ~ "Youth",
+      idx %in% 4:6 ~ "Amateur",
+      idx %in% 7:9 ~ "Professional")) %>%
+  select(ParticipantID, LeagueType, BetsAllowed, Response)
+```
+
+### Betting Statements {.hidden}
+
+```{r, include=FALSE}
+att <- att %>% mutate(across(starts_with("OtherStatements"), ~ case_when(
+          str_detect(as.character(.x), regex("Strongly disagree", ignore_case = TRUE)) ~ 0,
+          str_detect(as.character(.x), regex("Somewhat disagree", ignore_case = TRUE)) ~ 1,
+          str_detect(as.character(.x), regex("Neither agree nor disagree", ignore_case = TRUE)) ~ 2,
+          str_detect(as.character(.x), regex("Somewhat agree", ignore_case = TRUE)) ~ 3,
+          str_detect(as.character(.x), regex("Strongly agree", ignore_case = TRUE)) ~ 4,
+          TRUE ~ NA_real_),.names = "{.col}_num")) %>%
+          rename(EconomicBenefits = OtherStatements_1_num,
+                 NegativeConsequences = OtherStatements_2_num,
+                 FrequentAdvertisements = OtherStatements_3_num)
+```
+
+### Responsibility Statements {.hidden}
+
+```{r, include=FALSE}
+att <- att %>% mutate(across(starts_with("BlameStatments"),  ~ case_when(
+      str_detect(as.character(.x), regex("Not at all responsible", ignore_case = TRUE)) ~ 0,
+      str_detect(as.character(.x), regex("Slightly responsible", ignore_case = TRUE)) ~ 1,
+      str_detect(as.character(.x), regex("Moderately responsible", ignore_case = TRUE)) ~ 2,
+      str_detect(as.character(.x), regex("Very responsible", ignore_case = TRUE)) ~ 3,
+      str_detect(as.character(.x), regex("Completely responsible", ignore_case = TRUE)) ~ 4,
+      TRUE ~ NA_real_),
+    .names = "{.col}_num"))  %>%
+          rename(IndividualsBlame = BlameStatments_1_num,
+                 SportsBettingCompaniesBlame = BlameStatments_2_num,
+                 GovernmentBlame = BlameStatments_3_num,
+                 SportsOrganizationsBlame = BlameStatments_4_num,
+                 MediaBlame = BlameStatments_5_num)
+```
+
+### ATGS Cleaning {.hidden}
+
+```{r, include=FALSE}
+att <- att %>% mutate(across(
+    starts_with("ATGS_"), ~ case_when(
+      str_detect(as.character(.x), regex("^Strongly disagree$", ignore_case = TRUE)) ~ 0,
+      str_detect(as.character(.x), regex("^Somewhat disagree$", ignore_case = TRUE)) ~ 1,
+      str_detect(as.character(.x), regex("^Neither agree nor disagree$", ignore_case = TRUE)) ~ 2,
+      str_detect(as.character(.x), regex("^Somewhat agree$", ignore_case = TRUE)) ~ 3,
+      str_detect(as.character(.x), regex("^Strongly agree$", ignore_case = TRUE)) ~ 4,
+      TRUE ~ NA_real_
+    ), .names = "{.col}_num")) %>%
+  #Items 2, 3, 5, and 8 are reverse coded so that higher scores mean more favorable gambling attitudes (0 to 4 scale)
+  mutate(across(all_of(paste0("ATGS_", c(2, 3, 5, 8), "_num")),
+    ~ ifelse(is.na(.x), NA_real_, 4 - .x)))
+
+att <- att %>% mutate(ATGS_mean = rowMeans(
+      select(., starts_with("ATGS") & ends_with("_num")), na.rm = TRUE))
+```
+
+```{r, echo=FALSE}
+#Internal consistency of the ATGS-8 in this sample (reverse coded items included)
+atgsAlpha <- psych::alpha(select(att, starts_with("ATGS") & ends_with("_num")))
+atgsOmega <- suppressMessages(suppressWarnings(psych::omega(select(att, starts_with("ATGS") & ends_with("_num")), nfactors = 1, plot = FALSE)))
+tibble(CronbachAlpha = atgsAlpha$total$raw_alpha, McDonaldOmega = atgsOmega$omega.tot) %>%
+  kbl(digits = 2, caption = "ATGS-8 reliability") %>%
+  kable_styling(full_width = FALSE)
+```
+
+### Sports Engagement Cleaning {.hidden}
+
+```{r, include=FALSE}
+att <- att %>% mutate(across(starts_with("SportWatching_"), ~ case_when(
+          str_detect(.x, regex("Do not follow", ignore_case = TRUE)) ~ 0,
+          str_detect(.x, regex("Casually aware", ignore_case = TRUE)) ~ 1,
+          str_detect(.x, regex("Moderately follow", ignore_case = TRUE)) ~ 2,
+          str_detect(.x, regex("Very closely follow", ignore_case = TRUE)) ~ 4,
+          str_detect(.x, regex("Closely follow", ignore_case = TRUE)) ~ 3,
+          TRUE ~ NA_real_), .names = "{.col}_num"))
+
+att <- att %>% mutate(
+    SportsEngagementSum = rowSums(select(., starts_with("SportWatching_") & ends_with("_num")), na.rm = TRUE))
+
+att <- att %>% mutate(SportsEngagementProp =
+    rowMeans(select(., starts_with("SportWatching_") & ends_with("_num")) >= 1, na.rm = TRUE))
+```
+
+### Peer Influence {.hidden}
+
+```{r, include=FALSE}
+#Scored 0 (strongly disagree) to 6 (strongly agree) to match the bet allowance statements
+att <- att %>% mutate(PeerApproveNum = case_when(
+      str_detect(as.character(PeerApprove), regex("Strongly disagree", ignore_case = TRUE)) ~ 0,
+      str_detect(as.character(PeerApprove), regex("^Disagree$", ignore_case = TRUE)) ~ 1,
+      str_detect(as.character(PeerApprove), regex("Somewhat disagree", ignore_case = TRUE)) ~ 2,
+      str_detect(as.character(PeerApprove), regex("Neither", ignore_case = TRUE)) ~ 3,
+      str_detect(as.character(PeerApprove), regex("Somewhat agree", ignore_case = TRUE)) ~ 4,
+      str_detect(as.character(PeerApprove), regex("^Agree$", ignore_case = TRUE)) ~ 5,
+      str_detect(as.character(PeerApprove), regex("Strongly agree", ignore_case = TRUE)) ~ 6,
+      TRUE ~ NA_real_))
+
+att <- att %>% mutate(Recency = if_else(Recency >= 100, NA_real_, Recency))
+```
+
+### Variable Selection {.hidden}
+
+```{r, include=FALSE}
+indvData <- att %>% select(Duration..in.seconds., ParticipantID, PeerPercent_1, PeerApproveNum, PeerStruggle, SelfStruggle, Recency, Frequency, TypicalBet, YearBegin, NumPlatforms, TypeBet, Age, Gender, Financial.Wellbeing., Education, Race.Ethnicity, EconomicBenefits, NegativeConsequences, FrequentAdvertisements, IndividualsBlame, SportsBettingCompaniesBlame, GovernmentBlame, SportsOrganizationsBlame, MediaBlame, SportsEngagementProp, SportsEngagementSum, ATGS_mean)
+
+indvData <- indvData %>% filter(Gender != "Other")
+
+#Derived predictors are built once here so the person level and long formats always agree
+indvData <- indvData %>% mutate(
+    RaceBinary = if_else(Race.Ethnicity == "White (Non-Hispanic)", 1, 0),
+    #Scored 0 (cannot meet basic needs) to 6 (financially well-off)
+    FinancialNum = case_when(
+      str_detect(as.character(Financial.Wellbeing.),
+                 regex("cannot meet basic needs", ignore_case = TRUE)) ~ 0,
+      str_detect(as.character(Financial.Wellbeing.),
+                 regex("struggle to meet basic needs", ignore_case = TRUE)) ~ 1,
+      str_detect(as.character(Financial.Wellbeing.),
+                 regex("just meet basic needs", ignore_case = TRUE)) ~ 2,
+      str_detect(as.character(Financial.Wellbeing.),
+                 regex("little left over", ignore_case = TRUE)) ~ 3,
+      str_detect(as.character(Financial.Wellbeing.),
+                 regex("somewhat financially comfortable", ignore_case = TRUE)) ~ 4,
+      str_detect(as.character(Financial.Wellbeing.),
+                 regex("^I am financially comfortable$", ignore_case = TRUE)) ~ 5,
+      str_detect(as.character(Financial.Wellbeing.),
+                 regex("financially well[- ]*off", ignore_case = TRUE)) ~ 6,
+      TRUE ~ NA_real_),
+    #Less than a bachelor's degree is the reference level, so model coefficients and the dummy coded
+    #correlations both describe the effect of holding a bachelor's degree or higher
+    EducationBinary = factor(if_else(Education %in%
+      c("Bachelor's or 4 year degree (ex. BA, BS)",
+        "Masters degree (ex. MA, MS, MBA)",
+        "Doctorate or Professional degree (eg. PhD, MD, JD, DDS, EdD)"),
+      "Bachelor's or Higher",
+      "Less than Bachelor's"), levels = c("Less than Bachelor's", "Bachelor's or Higher")),
+    #Betting frequency, typical wager, and number of platforms have skew above 1 (see the skewness table),
+    #so they enter all correlations and models as log(x + 1). The raw values are kept for descriptives
+    FrequencyLog = log(Frequency + 1),
+    TypicalBetLog = log(TypicalBet + 1),
+    NumPlatformsLog = log(NumPlatforms + 1),
+    #Age and percent of peers who bet are rescaled for the models only (per 10 years and per 10 percentage
+    #points) so their coefficients are not displayed as 0.00. Correlations use the original units, which give identical r
+    Age10 = Age / 10,
+    PeerPercent10 = PeerPercent_1 / 10)
+
+personData <- indvData %>% distinct(ParticipantID, .keep_all = TRUE)
+
+longData <- attitude_statements_long %>%
+  inner_join(personData, by = "ParticipantID")
+
+longData$BetsAllowed <- factor(longData$BetsAllowed, levels = c("No bets allowed", "No proposition bets allowed", "All bets allowed"))
+longData$LeagueType <- factor(longData$LeagueType, levels = c("Youth", "Amateur", "Professional"))
+
+#Each contrast sums to zero and its absolute values sum to one
+#C1 compares the two adult leagues with youth leagues (youth = -0.50, amateur = 0.25, professional = 0.25)
+#C2 compares professional with amateur leagues (youth = 0, amateur = -0.50, professional = 0.50)
+#Because C1 spans 0.75 units, its coefficient equals the adult minus youth mean difference divided by 0.75.
+#C2 spans 1 unit, so its coefficient equals the professional minus amateur mean difference
+contrasts(longData$LeagueType) <- matrix(c(-0.50, 0.25, 0.25, 0, -0.50, 0.50), nrow = 3, byrow = FALSE,
+  dimnames = list(NULL, c("AdultVsYouth", "ProfessionalVsAmateur")))
+
+statementLabels <- c("No bets allowed" = "No bets should be allowed",
+  "No proposition bets allowed" = "Proposition bets should be banned",
+  "All bets allowed" = "All bets should be allowed")
+
+betShort <- c("No bets allowed" = "No bets",
+  "No proposition bets allowed" = "No props",
+  "All bets allowed" = "All bets")
+
+#One column per bet allowance cell so the nine statements can enter the person level correlation tables
+betCells <- expand_grid(BetsAllowed = levels(longData$BetsAllowed), LeagueType = levels(longData$LeagueType)) %>%
+  mutate(Cell = paste0(betShort[BetsAllowed], ": ", LeagueType))
+
+betAllowanceWide <- longData %>%
+  mutate(Cell = paste0(betShort[as.character(BetsAllowed)], ": ", LeagueType)) %>%
+  select(ParticipantID, Cell, Response) %>%
+  pivot_wider(names_from = Cell, values_from = Response)
+
+corData <- personData %>%
+  left_join(betAllowanceWide, by = "ParticipantID")
+```
+
+## Data Analysis
+
+### Summary Statistics
+
+#### Demographics (Table 2)
+
+```{r, echo=FALSE}
+kable(numericSummary(personData$Age), caption = "Age")
+kable(categoricalSummary(personData$Gender), caption = "Gender")
+kable(categoricalSummary(personData$Race.Ethnicity), caption = "Race/Ethnicity")
+kable(categoricalSummary(personData$Financial.Wellbeing.), caption = "Financial Wellbeing")
+kable(categoricalSummary(personData$Education), caption = "Education")
+
+#Median completion time reported in Participants and Demographic Information
+medianSeconds <- median(personData$Duration..in.seconds.)
+sprintf("Median completion time: %d minutes %d seconds", medianSeconds %/% 60, round(medianSeconds %% 60))
+```
+
+#### Sports Betting Habits
+
+```{r, echo=FALSE}
+kable(numericSummary(personData$Recency), caption = "Days since last bet placed")
+kable(numericSummary(personData$Frequency), caption = "Number of bets placed in a typical week")
+kable(numericSummary(personData$TypicalBet), caption = "Average amount of $ placed on a bet")
+kable(numericSummary(personData$YearBegin), caption = "Year participant began sports betting")
+kable(numericSummary(personData$NumPlatforms), caption = "Number of sports betting platforms used")
+kable(categoricalSummary(personData$TypeBet), caption = "Most common type of bet placed")
+
+#Percent placing fewer than one bet per week (Summary Statistics) and percent who have ever bet (Limitations)
+tibble(FewerThanOneBetPerWeek = 100 * mean(personData$Frequency < 1),
+  EverPlacedBet = 100 * mean(personData$TypeBet != "I have never placed a sports bet")) %>%
+  kbl(digits = 2, caption = "Betting activity percentages reported in the text") %>%
+  kable_styling(full_width = FALSE)
+```
+
+#### Sports Engagement
+
+```{r, echo=FALSE}
+kable(numericSummary(personData$SportsEngagementSum), caption = "Sports Engagement Sum Score")
+kable(numericSummary(personData$SportsEngagementProp*15), caption = "Number of Leagues Followed")
+```
+
+#### Peer Influence
+
+```{r, echo=FALSE}
+kable(numericSummary(personData$PeerPercent_1), caption = "Percent Peers Bet")
+kable(numericSummary(personData$PeerApproveNum), caption = "Peer Approval Rating")
+kable(categoricalSummary(personData$PeerStruggle), caption = "Peers Struggle With Gambling Addiction")
+kable(categoricalSummary(personData$SelfStruggle), caption = "Self Struggle With Gambling Addiction")
+```
+
+#### Attitudes Toward Gambling
+
+```{r, echo=FALSE}
+kable(numericSummary(personData$ATGS_mean), caption = "ATGS")
+```
+
+#### Betting Statements
+
+```{r, echo=FALSE}
+kable(numericSummary(personData$EconomicBenefits), caption = "Provides meaningful economic benefits")
+kable(numericSummary(personData$NegativeConsequences), caption = "Concern about potential negative consequences")
+kable(numericSummary(personData$FrequentAdvertisements), caption = "Sports betting advertisements are too frequent")
+```
+
+#### Responsibility Statements
+
+```{r, echo=FALSE}
+kable(numericSummary(personData$IndividualsBlame), caption = "Individual sports bettors")
+kable(numericSummary(personData$SportsBettingCompaniesBlame), caption = "Sports betting companies")
+kable(numericSummary(personData$GovernmentBlame), caption = "Government regulators")
+kable(numericSummary(personData$SportsOrganizationsBlame), caption = "Sports leagues and organizations")
+kable(numericSummary(personData$MediaBlame), caption = "Broadcasters and media platforms")
+```
+
+#### Bet Allowance
+
+Each of the nine statements keeps the rating participants gave it, from 0 (strongly disagree) to 6 (strongly agree). Higher scores mean more agreement with that specific statement, so they are not on a shared permissiveness scale and are summarized separately.
+
+```{r, echo=FALSE}
+longData %>%
+  group_by(BetsAllowed, LeagueType) %>%
+  summarise(
+    n = sum(!is.na(Response)),
+    Mean = round(mean(Response, na.rm = TRUE), 2),
+    SD = round(sd(Response, na.rm = TRUE), 2),
+    Min = round(min(Response, na.rm = TRUE), 2),
+    Median = round(median(Response, na.rm = TRUE), 2),
+    Max = round(max(Response, na.rm = TRUE), 2),
+    .groups = "drop") %>%
+  mutate(Statement = statementLabels[as.character(BetsAllowed)], .before = 1) %>%
+  select(-BetsAllowed) %>%
+  kbl(caption = "Agreement with each bet allowance statement by league type") %>%
+  kable_styling(full_width = FALSE) %>%
+  collapse_rows(columns = 1, valign = "top")
+```
+
+```{r, echo=FALSE}
+agreement_df <- longData %>%
+  group_by(BetsAllowed, LeagueType) %>%
+  summarise(
+    n = sum(!is.na(Response)),
+    mean = mean(Response, na.rm = TRUE),
+    se = sd(Response, na.rm = TRUE) / sqrt(n),
+    ci = qt(0.975, df = n - 1) * se,
+    .groups = "drop")
+
+agreement_plot <- ggplot(agreement_df, aes(x = LeagueType, y = mean, fill = LeagueType)) +
+  geom_col(width = 0.8) +
+  geom_errorbar(aes(ymin = mean - ci, ymax = mean + ci),
+    width = 0.2) +
+  geom_text(aes(label = sprintf("%.2f", mean), y = -0.2),
+    size = 3) +
+  facet_wrap(~ BetsAllowed, labeller = labeller(BetsAllowed = statementLabels)) +
+  theme_minimal() +
+  coord_cartesian(ylim = c(0, 6)) +
+  scale_fill_manual(values = threeColors) +
+  labs(title = NULL,
+    x = "League Type",
+    y = "Mean Agreement") +
+  theme(strip.text = element_text(face = "bold"),
+    panel.border = element_rect(color = "grey70", fill = NA),
+    panel.spacing = unit(1, "lines"),
+    axis.title.x = element_text(margin = margin(t = 10)),
+    axis.text.x = element_text(margin = margin(t = 5)),
+    axis.title.y = element_text(margin = margin(r = 10)),
+    legend.position = "none")
+
+agreement_plot
+```
+
+#### Skewness of Continuous Variables (Table 3)
+
+Variables with absolute skewness above 1 are summarized with the median and interquartile range (IQR) and enter the correlations and models as log(x + 1). All others are summarized with the mean and standard deviation and enter the analyses untransformed.
+
+```{r, echo=FALSE}
+table3Vars <- tribble(
+  ~Group, ~Variable, ~Label,
+  "Sports betting habits", "Frequency", "Bets placed per week",
+  "Sports betting habits", "TypicalBet", "Typical wager amount ($)",
+  "Sports betting habits", "NumPlatforms", "Number of sports betting platforms used",
+  "Sports engagement", "SportsEngagementCount", "Number of leagues followed (of 15)",
+  "Peer influence", "PeerPercent_1", "Percent of peers who regularly bet on sports",
+  "Peer influence", "PeerApproveNum", "Peer approval of sports betting (0 to 6)",
+  "General gambling attitudes", "ATGS_mean", "ATGS-8 (0 to 4)",
+  "Sports betting attitudes", "EconomicBenefits", "Economic benefits (0 to 4)",
+  "Sports betting attitudes", "NegativeConsequences", "Concern about negative consequences (0 to 4)",
+  "Sports betting attitudes", "FrequentAdvertisements", "Advertisements are too frequent (0 to 4)",
+  "Responsibility (0 to 4)", "SportsBettingCompaniesBlame", "Sports betting companies",
+  "Responsibility (0 to 4)", "IndividualsBlame", "Individual sports bettors",
+  "Responsibility (0 to 4)", "GovernmentBlame", "Government regulators",
+  "Responsibility (0 to 4)", "SportsOrganizationsBlame", "Sports leagues and organizations",
+  "Responsibility (0 to 4)", "MediaBlame", "Broadcasters and media platforms")
+
+table3Data <- personData %>% mutate(SportsEngagementCount = SportsEngagementProp * 15)
+
+skewSE <- function(n) sqrt(6 * n * (n - 1) / ((n - 2) * (n + 1) * (n + 3)))
+
+table3 <- table3Vars %>%
+  rowwise() %>%
+  mutate(x = list(table3Data[[Variable]][!is.na(table3Data[[Variable]])]),
+    n = length(x),
+    Skew = skewness(x),
+    SkewZ = Skew / skewSE(n),
+    Statistic = if_else(abs(Skew) > 1, "Median [IQR]", "M (SD)"),
+    Value = if_else(abs(Skew) > 1,
+      sprintf("%.2f [%.2f, %.2f]", median(x), quantile(x, .25), quantile(x, .75)),
+      sprintf("%.2f (%.2f)", mean(x), sd(x))),
+    Range = sprintf("%g to %g", min(x), max(x))) %>%
+  ungroup() %>%
+  select(Group, Label, n, Skew, SkewZ, Statistic, Value, Range)
+
+table3 %>%
+  kbl(digits = 2, caption = "Table 3 draft: summary of continuous variables with skewness") %>%
+  kable_styling(full_width = FALSE) %>%
+  collapse_rows(columns = 1, valign = "top") %>%
+  footnote(general = "Skew above 1 in absolute value is treated as substantial (Bulmer, 1979). The z values are skew divided by its standard error and are shown for reference only; at n = 445 almost any departure from symmetry is significant, so the absolute cutoff is used to decide.",
+    general_title = "Note. ",
+    footnote_as_chunk = TRUE)
+```
+
+```{r, echo=FALSE}
+#The three youth league cells have skew above 1, so the same rule reports them as Median [IQR] in Table 3.
+#They are outcomes, not predictors, so they are not transformed
+longData %>%
+  group_by(BetsAllowed, LeagueType) %>%
+  summarise(Skew = skewness(Response),
+    Statistic = if_else(abs(Skew) > 1, "Median [IQR]", "M (SD)"),
+    Value = if_else(abs(Skew) > 1,
+      sprintf("%.2f [%.2f, %.2f]", median(Response), quantile(Response, .25), quantile(Response, .75)),
+      sprintf("%.2f (%.2f)", mean(Response), sd(Response))),
+    .groups = "drop") %>%
+  kbl(digits = 2, caption = "Skewness of the nine bet allowance statements") %>%
+  kable_styling(full_width = FALSE)
+```
+
+### Correlations
+
+```{r, include=FALSE}
+individualLabels <- c(Age = "Age",
+  Gender = "Gender",
+  EducationBinary = "Education",
+  FinancialNum = "Financial wellbeing",
+  RaceBinary = "White (Non-Hispanic)",
+  ATGS_mean = "ATGS",
+  PeerPercent_1 = "Percent of peers who bet",
+  PeerApproveNum = "Peer approval",
+  PeerStruggle = "Peer gambling struggle",
+  SelfStruggle = "Self gambling struggle",
+  FrequencyLog = "Bets per week (log)",
+  TypicalBetLog = "Typical wager (log)",
+  NumPlatformsLog = "Number of platforms (log)",
+  SportsEngagementProp = "Sports engagement")
+
+responsibilityLabels <- c(IndividualsBlame = "Blame: individual bettors",
+  SportsBettingCompaniesBlame = "Blame: betting companies",
+  GovernmentBlame = "Blame: government",
+  SportsOrganizationsBlame = "Blame: sports organizations",
+  MediaBlame = "Blame: media")
+
+statementVarLabels <- c(EconomicBenefits = "Economic benefits",
+  NegativeConsequences = "Negative consequences",
+  FrequentAdvertisements = "Frequent advertisements")
+
+betAllowanceLabels <- setNames(betCells$Cell, betCells$Cell)
+otherDvLabels <- c(responsibilityLabels, statementVarLabels)
+
+corIndividual <- designColumns(corData, names(individualLabels), individualLabels)
+corBetAllowance <- designColumns(corData, names(betAllowanceLabels), betAllowanceLabels)
+corOtherDv <- designColumns(corData, names(otherDvLabels), otherDvLabels)
+```
+
+#### Individual Difference Variables (Table A1)
+
+```{r, echo=FALSE, warning=FALSE}
+corTable(corIndividual, caption = "Correlations among individual difference variables")
+```
+
+#### Individual Differences with Bet Allowance Statements (Table A2, top)
+
+```{r, echo=FALSE, warning=FALSE}
+corTable(corIndividual, corBetAllowance, holmBy = "column", caption = "Correlations between individual difference variables and the nine bet allowance statements")
+```
+
+#### Individual Differences with Responsibility and Betting Statement Variables (Table A2, bottom)
+
+```{r, echo=FALSE, warning=FALSE}
+corTable(corIndividual, corOtherDv, holmBy = "column", caption = "Correlations between individual difference variables and the responsibility, economic benefits, negative consequences, and advertising variables")
+```
+
+#### Bet Allowance Statements (Table A3, top)
+
+```{r, echo=FALSE, warning=FALSE}
+corTable(corBetAllowance, caption = "Correlations among the nine bet allowance statements")
+```
+
+#### Responsibility and Betting Statement Variables (Table A3, bottom)
+
+```{r, echo=FALSE, warning=FALSE}
+corTable(corOtherDv, caption = "Correlations among the responsibility, economic benefits, negative consequences, and advertising variables")
+```
+
+#### Bet Allowance Statements with Responsibility and Betting Statement Variables (supplementary)
+
+```{r, echo=FALSE, warning=FALSE}
+corTable(corBetAllowance, corOtherDv, holmBy = "column", caption = "Correlations between the nine bet allowance statements and the responsibility, economic benefits, negative consequences, and advertising variables")
+```
+
+### Agreement With Each Statement (Table 4)
+
+Agreement is 4 to 6 on the 0 to 6 bet allowance scale and 3 to 4 on the 0 to 4 betting statement scale. Disagreement is 0 to 2 and 0 to 1, and neutral is the scale midpoint.
+
+```{r, echo=FALSE}
+pctRow <- function(x, lo, mid, hi) {
+  c(Disagree = 100 * mean(x <= lo), Neutral = 100 * mean(x == mid), Agree = 100 * mean(x >= hi))
+}
+
+statementPct <- longData %>%
+  group_by(BetsAllowed, LeagueType) %>%
+  summarise(as_tibble_row(pctRow(Response, 2, 3, 4)), n = n(), .groups = "drop")
+
+beliefPct <- map_dfr(names(statementVarLabels), function(v) {
+  as_tibble_row(c(pctRow(personData[[v]], 1, 2, 3), n = nrow(personData))) %>%
+    mutate(Statement = statementVarLabels[[v]], .before = 1)
+})
+
+statementPct %>%
+  kbl(digits = 1, caption = "Table 4 (top): percent disagreeing, neutral, and agreeing with each bet allowance statement") %>%
+  kable_styling(full_width = FALSE) %>%
+  collapse_rows(columns = 1, valign = "top")
+
+beliefPct %>%
+  kbl(digits = 1, caption = "Table 4 (bottom): percent disagreeing, neutral, and agreeing with each betting statement") %>%
+  kable_styling(full_width = FALSE)
+```
+
+### Bet Allowance Models
+
+Each bet allowance statement is modeled separately, so the three models below are independent of one another. Within each model every participant contributes three observations, one per league, so a random intercept for participant accounts for the repeated measures. League type is contrast coded so each contrast sums to zero and its absolute values sum to one. C1 (AdultVsYouth) compares amateur and professional leagues against youth leagues (youth = -0.50, amateur = 0.25, professional = 0.25), and C2 (ProfessionalVsAmateur) compares professional against amateur leagues (youth = 0, amateur = -0.50, professional = 0.50). All other predictors are measured once per participant. Betting frequency, typical wager, and number of platforms enter as log(x + 1).
+
+```{r, include=FALSE}
+individualPredictors <- c("Age10", "Gender", "EducationBinary", "FinancialNum", "RaceBinary", "ATGS_mean", "PeerPercent10", "PeerApproveNum", "PeerStruggle", "SelfStruggle", "FrequencyLog", "TypicalBetLog", "NumPlatformsLog", "SportsEngagementProp")
+
+responsibilityPredictors <- c("IndividualsBlame", "SportsBettingCompaniesBlame", "GovernmentBlame", "SportsOrganizationsBlame", "MediaBlame")
+
+statementPredictors <- c("EconomicBenefits", "NegativeConsequences", "FrequentAdvertisements")
+
+betAllowancePredictors <- c("LeagueType", individualPredictors, responsibilityPredictors, statementPredictors)
+
+no_bets_data <- longData %>% filter(BetsAllowed == "No bets allowed")
+no_props_data <- longData %>% filter(BetsAllowed == "No proposition bets allowed")
+all_bets_data <- longData %>% filter(BetsAllowed == "All bets allowed")
+
+betAllowanceLabelsShort <- c("No bets allowed", "No proposition bets allowed", "All bets allowed")
+```
+
+#### Models (Table 5)
+
+```{r, echo=FALSE}
+no_bets_model <- lmer(modelFormula("Response", betAllowancePredictors, "(1 | ParticipantID)"), data = no_bets_data)
+
+no_props_model <- lmer(modelFormula("Response", betAllowancePredictors, "(1 | ParticipantID)"), data = no_props_data)
+
+all_bets_model <- lmer(modelFormula("Response", betAllowancePredictors, "(1 | ParticipantID)"), data = all_bets_data)
+
+betAllowanceModels <- list(no_bets_model, no_props_model, all_bets_model)
+
+tab_model(no_bets_model, no_props_model, all_bets_model, show.ci = 0.95, dv.labels = betAllowanceLabelsShort)
+```
+
+#### Joint Test of Betting Activity
+
+Bets per week, typical wager, and number of platforms are correlated (r = .38 to .67), so they are also tested together. Likelihood ratio tests compare each model with and without the three measures (both refit with maximum likelihood). A composite of the three standardized measures then replaces them in each model.
+
+```{r, echo=FALSE, message=FALSE}
+activityVars <- c("FrequencyLog", "TypicalBetLog", "NumPlatformsLog")
+withoutActivity <- paste(". ~ . -", paste(activityVars, collapse = " - "))
+
+activityLRT <- map2_dfr(betAllowanceModels, betAllowanceLabelsShort, function(m, l) {
+  a <- anova(update(m, as.formula(withoutActivity)), m)
+  tibble(Model = l, ChiSq = a$Chisq[2], df = a$Df[2], p = a$`Pr(>Chisq)`[2])
+})
+
+activityLRT %>%
+  kbl(digits = 3, caption = "Likelihood ratio tests for the three betting activity measures") %>%
+  kable_styling(full_width = FALSE)
+
+zScore <- function(x) (x - mean(x)) / sd(x)
+activityIndex <- personData %>%
+  transmute(ParticipantID, ActivityIndex = (zScore(FrequencyLog) + zScore(TypicalBetLog) + zScore(NumPlatformsLog)) / 3)
+
+tibble(CronbachAlpha = psych::alpha(personData[, activityVars])$total$raw_alpha) %>%
+  kbl(digits = 2, caption = "Internal consistency of the three betting activity measures") %>%
+  kable_styling(full_width = FALSE)
+
+compositePredictors <- c(setdiff(betAllowancePredictors, activityVars), "ActivityIndex")
+
+map2_dfr(list(no_bets_data, no_props_data, all_bets_data), betAllowanceLabelsShort, function(d, l) {
+  m <- lmer(modelFormula("Response", compositePredictors, "(1 | ParticipantID)"), data = left_join(d, activityIndex, by = "ParticipantID"))
+  s <- coef(summary(m))["ActivityIndex", ]
+  ci <- confint(m, "ActivityIndex", method = "Wald")
+  tibble(Model = l, b = s[["Estimate"]], CILow = ci[1], CIHigh = ci[2], p = s[["Pr(>|t|)"]])
+}) %>%
+  kbl(digits = 3, caption = "Betting activity composite in place of the three measures") %>%
+  kable_styling(full_width = FALSE)
+```
+
+#### Model Fit
+
+```{r, echo=FALSE}
+mixedFitTable(betAllowanceModels, betAllowanceLabelsShort, caption = "Fit and variance components for the bet allowance models")
+```
+
+A high ICC means agreement is strongly clustered within participants, which is the reason for the random intercept. Marginal R squared is the share of variance the predictors explain and conditional R squared adds the participant intercept. Singular should read FALSE; TRUE would mean the participant variance is estimated at zero and the random intercept is not supported.
+
+#### Multicollinearity
+
+```{r, echo=FALSE}
+vifTable(betAllowanceModels, betAllowanceLabelsShort, caption = "Variance inflation factors for the bet allowance models")
+```
+
+The three models share an identical predictor matrix, so their VIFs are identical by construction. VIF depends only on the relationships among predictors and never on the outcome.
+
+#### Residual Diagnostics
+
+```{r, echo=FALSE, warning=FALSE}
+residualTable(betAllowanceModels, betAllowanceLabelsShort, caption = "Residual distribution for the bet allowance models")
+
+betAllowancePlots <- residualPlots(betAllowanceModels, betAllowanceLabelsShort)
+betAllowancePlots$fitted
+betAllowancePlots$qq
+```
+
+Linear mixed models assume residuals with constant variance and an approximately normal distribution, and normally distributed random intercepts. The residual plots should show no funnel shape or curvature, and the quantile plots should stay near the diagonal. Because responses are bounded integers from 0 to 6, mild banding in the residual plots is expected and is not by itself a problem.
+
+```{r, echo=FALSE}
+tibble(Model = betAllowanceLabelsShort,
+  InterceptSkew = sapply(betAllowanceModels, function(m) skewness(ranef(m)$ParticipantID[, 1])),
+  InterceptKurtosis = sapply(betAllowanceModels, function(m) kurtosis(ranef(m)$ParticipantID[, 1])),
+  InterceptShapiroP = sapply(betAllowanceModels, function(m) shapiro.test(ranef(m)$ParticipantID[, 1])$p.value)) %>%
+  kbl(digits = 3, caption = "Distribution of the participant random intercepts") %>%
+  kable_styling(full_width = FALSE)
+```
+
+### Betting Statement Models (Table 6)
+
+The three betting statements are measured once per participant, so these are ordinary regressions with no random effect. Predictors are the individual difference variables and the five responsibility statements. The betting statements appear as predictors in the bet allowance models above and as outcomes here, so the two sections answer different questions and should not be read as a single causal chain.
+
+```{r, echo=FALSE}
+statementModelPredictors <- c(individualPredictors, responsibilityPredictors)
+
+regression_economic <- lm(modelFormula("EconomicBenefits", statementModelPredictors), data = personData)
+
+regression_consequences <- lm(modelFormula("NegativeConsequences", statementModelPredictors), data = personData)
+
+regression_advertising <- lm(modelFormula("FrequentAdvertisements", statementModelPredictors), data = personData)
+
+statementModels <- list(regression_economic, regression_consequences, regression_advertising)
+statementModelLabels <- c("Economic benefits", "Negative consequences", "Frequent advertisements")
+
+tab_model(regression_economic, regression_consequences, regression_advertising, show.ci = 0.95, dv.labels = statementModelLabels)
+```
+
+```{r, echo=FALSE}
+#Joint test of the three betting activity measures in each betting statement model
+map2_dfr(statementModels, statementModelLabels, function(m, l) {
+  m0 <- update(m, as.formula(withoutActivity))
+  a <- anova(m0, m)
+  tibble(Model = l, F = a$F[2], df1 = a$Df[2], df2 = a$Res.Df[2], p = a$`Pr(>F)`[2],
+    DeltaR2 = summary(m)$r.squared - summary(m0)$r.squared)
+}) %>%
+  kbl(digits = 3, caption = "Joint F tests for the three betting activity measures") %>%
+  kable_styling(full_width = FALSE)
+```
+
+#### Model Fit and Assumptions
+
+```{r, echo=FALSE}
+lmFitTable(statementModels, statementModelLabels, caption = "Fit, multicollinearity, and assumption checks for the betting statement models")
+```
+
+#### Multicollinearity
+
+```{r, echo=FALSE}
+vifTable(statementModels, statementModelLabels, caption = "Variance inflation factors for the betting statement models")
+```
+
+#### Residual Diagnostics
+
+```{r, echo=FALSE, warning=FALSE}
+residualTable(statementModels, statementModelLabels, caption = "Residual distribution for the betting statement models")
+
+statementPlots <- residualPlots(statementModels, statementModelLabels)
+statementPlots$fitted
+statementPlots$qq
+```
+
+```{r, echo=FALSE}
+#HC3 robust standard errors as a sensitivity check, because the Breusch-Pagan test flags heteroscedasticity
+#in some models. Rows list every term whose significance at .05 differs between OLS and HC3
+robustCheck <- function(models, labels) {
+  map2_dfr(models, labels, function(m, l) {
+    s <- coef(summary(m))
+    robust <- lmtest::coeftest(m, vcov. = sandwich::vcovHC(m, type = "HC3"))
+    tibble(Model = l, Term = rownames(s), b = s[, 1], pOLS = s[, 4], pHC3 = robust[, 4])
+  }) %>%
+    filter(Term != "(Intercept)", (pOLS < .05) != (pHC3 < .05))
+}
+
+robustCheck(statementModels, statementModelLabels) %>%
+  kbl(digits = 3, caption = "Terms whose significance changes with HC3 robust standard errors") %>%
+  kable_styling(full_width = FALSE)
+```
+
+These outcomes are integers bounded between 0 and 4, so residuals will fall on discrete bands and the tails of the quantile plots will deviate from the diagonal. Ordinary regression is robust to that at this sample size. The Breusch-Pagan test is the check that matters more here: a significant result means the residual variance is not constant, which leaves the coefficients unbiased but makes the standard errors, confidence intervals, and p values unreliable. Heteroscedasticity-robust (HC3) standard errors are the usual remedy and can be added with the sandwich and lmtest packages.
+
+### Comparing Responsibility Across Groups
+
+The five responsibility ratings are repeated measures, so a one-way repeated measures ANOVA tests whether mean responsibility differs across groups. Mauchly's test checks sphericity and the Greenhouse-Geisser correction is applied when it is violated. Follow-up paired t tests compare every pair of groups with Holm-adjusted p values, and Cohen's dz (mean difference divided by the standard deviation of the differences) gives the effect size for each pair.
+
+```{r, echo=FALSE, message=FALSE}
+responsibilityModelLabels <- c("Individual bettors", "Betting companies", "Government regulators", "Sports organizations", "Media platforms")
+
+responsibilityLong <- personData %>%
+  select(ParticipantID, all_of(responsibilityPredictors)) %>%
+  pivot_longer(-ParticipantID, names_to = "Group", values_to = "Rating") %>%
+  mutate(Group = factor(Group, levels = responsibilityPredictors, labels = responsibilityModelLabels))
+
+responsibilityAnova <- afex::aov_ez(id = "ParticipantID", dv = "Rating", data = responsibilityLong, within = "Group",
+  anova_table = list(correction = "GG", es = c("pes", "ges")))
+
+responsibilityAnova$anova_table %>%
+  as.data.frame() %>% as_tibble(rownames = "Effect") %>%
+  kbl(digits = 3, caption = "Repeated measures ANOVA on responsibility ratings (Greenhouse-Geisser corrected)") %>%
+  kable_styling(full_width = FALSE)
+
+summary(responsibilityAnova)$pval.adjustments %>%
+  unclass() %>% as.data.frame() %>% as_tibble(rownames = "Effect") %>%
+  kbl(digits = 3, caption = "Sphericity corrections") %>%
+  kable_styling(full_width = FALSE)
+
+summary(responsibilityAnova)$sphericity.tests %>%
+  unclass() %>% as.data.frame() %>% as_tibble(rownames = "Effect") %>%
+  kbl(digits = 3, caption = "Mauchly's test of sphericity") %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r, echo=FALSE}
+responsibilityWide <- personData %>% select(all_of(responsibilityPredictors))
+names(responsibilityWide) <- responsibilityModelLabels
+
+responsibilityPairs <- combn(responsibilityModelLabels, 2, simplify = FALSE) %>%
+  map_dfr(function(p) {
+    d <- responsibilityWide[[p[1]]] - responsibilityWide[[p[2]]]
+    tt <- t.test(responsibilityWide[[p[1]]], responsibilityWide[[p[2]]], paired = TRUE)
+    tibble(GroupA = p[1], GroupB = p[2],
+      MeanA = mean(responsibilityWide[[p[1]]]), MeanB = mean(responsibilityWide[[p[2]]]),
+      MeanDiff = mean(d), CILow = tt$conf.int[1], CIHigh = tt$conf.int[2],
+      t = unname(tt$statistic), df = unname(tt$parameter), p = tt$p.value,
+      dz = mean(d) / sd(d))
+  }) %>%
+  mutate(pHolm = p.adjust(p, method = "holm")) %>%
+  arrange(desc(abs(MeanDiff)))
+
+responsibilityPairs %>%
+  kbl(digits = 3, caption = "Pairwise comparisons of responsibility ratings (paired t tests, Holm adjusted)") %>%
+  kable_styling(full_width = FALSE) %>%
+  footnote(general = "MeanDiff is Group A minus Group B. dz is the mean difference divided by the SD of the paired differences. pHolm is adjusted across all 10 comparisons.",
+    general_title = "Note. ",
+    footnote_as_chunk = TRUE)
+```
+
+### Responsibility Models (Table 7)
+
+The five responsibility statements are predicted from the individual difference variables only. No responsibility rating is used to predict another, and the betting statements are excluded so these models stay a clean test of who attributes responsibility to each group.
+
+```{r, echo=FALSE}
+regression_individuals_blame <- lm(modelFormula("IndividualsBlame", individualPredictors), data = personData)
+
+regression_companies_blame <- lm(modelFormula("SportsBettingCompaniesBlame", individualPredictors), data = personData)
+
+regression_government_blame <- lm(modelFormula("GovernmentBlame", individualPredictors), data = personData)
+
+regression_organizations_blame <- lm(modelFormula("SportsOrganizationsBlame", individualPredictors), data = personData)
+
+regression_media_blame <- lm(modelFormula("MediaBlame", individualPredictors), data = personData)
+
+responsibilityModels <- list(regression_individuals_blame, regression_companies_blame, regression_government_blame, regression_organizations_blame, regression_media_blame)
+responsibilityModelLabels <- c("Individual bettors", "Betting companies", "Government regulators", "Sports organizations", "Media platforms")
+
+tab_model(regression_individuals_blame, regression_companies_blame, regression_government_blame, regression_organizations_blame, regression_media_blame, show.ci = 0.95, dv.labels = responsibilityModelLabels)
+```
+
+#### Model Fit and Assumptions
+
+```{r, echo=FALSE}
+lmFitTable(responsibilityModels, responsibilityModelLabels, caption = "Fit, multicollinearity, and assumption checks for the responsibility models")
+```
+
+#### Multicollinearity
+
+```{r, echo=FALSE}
+vifTable(responsibilityModels, responsibilityModelLabels, caption = "Variance inflation factors for the responsibility models")
+```
+
+#### Residual Diagnostics
+
+```{r, echo=FALSE, warning=FALSE}
+residualTable(responsibilityModels, responsibilityModelLabels, caption = "Residual distribution for the responsibility models")
+
+responsibilityPlots <- residualPlots(responsibilityModels, responsibilityModelLabels)
+responsibilityPlots$fitted
+responsibilityPlots$qq
+```
+
+```{r, echo=FALSE}
+robustCheck(responsibilityModels, responsibilityModelLabels) %>%
+  kbl(digits = 3, caption = "Terms whose significance changes with HC3 robust standard errors") %>%
+  kable_styling(full_width = FALSE)
+```
+
+Five models share one predictor set here, so a predictor that is significant in a single model is being read against fifteen tests of that predictor across the whole section. That is worth stating when a single coefficient carries an argument, even though no correction is applied within a regression table.
+
+### Values Cited in the Text
+
+```{r, echo=FALSE}
+#Highest VIF across all 11 models (Analytic Overview)
+allModels <- c(betAllowanceModels, statementModels, responsibilityModels)
+tibble(HighestVIF = max(sapply(allModels, function(m) max(vifValues(m))))) %>%
+  kbl(digits = 2, caption = "Highest variance inflation factor across all models") %>%
+  kable_styling(full_width = FALSE)
+
+#Agreement that advertisements are too frequent among participants who had and had not placed a bet (Policy Implications)
+personData %>%
+  mutate(EverBet = if_else(TypeBet == "I have never placed a sports bet", "Never bet", "Has bet")) %>%
+  group_by(EverBet) %>%
+  summarise(n = n(), AgreeAdsTooFrequent = 100 * mean(FrequentAdvertisements >= 3)) %>%
+  kbl(digits = 1, caption = "Agreement that sports betting advertisements are too frequent, by betting history") %>%
+  kable_styling(full_width = FALSE)
+```
